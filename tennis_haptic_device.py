@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 Visually impaired tennis haptic feedback device (Upgraded with Shape/Motion Filters)
 
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import os
 import sys
@@ -19,11 +20,22 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
-import cv2
-import numpy as np
-from tqdm import tqdm
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 # =============================================================================
 # Constants
@@ -843,6 +855,418 @@ def score_candidate(candidate: DetectionCandidate) -> float:
 
 
 # =============================================================================
+# SofaScore Live Tennis Text Output
+# =============================================================================
+
+SOFASCORE_BASE_URLS = (
+    "https://api.sofascore.com/api/v1",
+    "https://www.sofascore.com/api/v1",
+)
+
+
+@dataclass
+class TennisEventSelection:
+    event_id: int
+    title: str
+    tournament: str
+
+
+class SofascoreClient:
+    def __init__(self, timeout: float = 12.0) -> None:
+        self.timeout = timeout
+        self.headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+            "Referer": "https://www.sofascore.com/tennis",
+        }
+
+    def get_json(self, path: str) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for base_url in SOFASCORE_BASE_URLS:
+            url = f"{base_url}{path}"
+            try:
+                return self._get_json_with_urllib(url)
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+                last_error = exc
+                try:
+                    return self._get_json_with_curl_cffi(url)
+                except RuntimeError as fallback_exc:
+                    last_error = fallback_exc
+
+        raise RuntimeError(
+            "SofaScore 정보를 불러오지 못했습니다. "
+            "사이트에서 비브라우저 요청을 차단할 수 있습니다. "
+            f"마지막 오류: {last_error}"
+        )
+
+    def _get_json_with_urllib(self, url: str) -> dict[str, Any]:
+        request = urllib.request.Request(url, headers=self.headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            payload = response.read().decode("utf-8")
+            return json.loads(payload)
+
+    def _get_json_with_curl_cffi(self, url: str) -> dict[str, Any]:
+        """
+        Optional fallback for environments where SofaScore blocks urllib.
+
+        Install only if needed:
+            pip install curl_cffi
+        """
+
+        try:
+            from curl_cffi import requests as curl_requests
+        except Exception as exc:
+            raise RuntimeError(f"curl_cffi fallback을 사용할 수 없습니다: {exc}") from exc
+
+        response = curl_requests.get(
+            url,
+            headers=self.headers,
+            timeout=self.timeout,
+            impersonate="chrome",
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"curl_cffi 요청 실패: HTTP {response.status_code}")
+        return dict(response.json())
+
+    def live_tennis_events(self) -> list[dict[str, Any]]:
+        data = self.get_json("/sport/tennis/events/live")
+        return list(data.get("events", []))
+
+    def event_detail(self, event_id: int) -> dict[str, Any]:
+        data = self.get_json(f"/event/{event_id}")
+        return dict(data.get("event", data))
+
+    def event_statistics(self, event_id: int) -> dict[str, Any]:
+        return self.get_json(f"/event/{event_id}/statistics")
+
+
+def clean_text(value: Any, default: str = "정보 없음") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def team_name(team: dict[str, Any]) -> str:
+    return clean_text(team.get("name") or team.get("shortName"))
+
+
+def event_title(event: dict[str, Any]) -> str:
+    home = team_name(event.get("homeTeam", {}))
+    away = team_name(event.get("awayTeam", {}))
+    return f"{home} 대 {away}"
+
+
+def tournament_name(event: dict[str, Any]) -> str:
+    tournament = event.get("tournament", {}) or {}
+    unique_tournament = tournament.get("uniqueTournament", {}) or {}
+    return clean_text(unique_tournament.get("name") or tournament.get("name"))
+
+
+def status_text(event: dict[str, Any]) -> str:
+    status = event.get("status", {}) or {}
+    description = clean_text(status.get("description"), "상태 정보 없음")
+    status_type = clean_text(status.get("type"), "")
+    if status_type:
+        return f"{description} ({status_type})"
+    return description
+
+
+def score_value(score: dict[str, Any], key: str) -> str | None:
+    value = score.get(key)
+    if value is None:
+        return None
+    return str(value)
+
+
+def list_set_keys(home_score: dict[str, Any], away_score: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for index in range(1, 6):
+        key = f"period{index}"
+        if key in home_score or key in away_score:
+            keys.append(key)
+    return keys
+
+
+def format_set_scores(event: dict[str, Any]) -> str:
+    home = team_name(event.get("homeTeam", {}))
+    away = team_name(event.get("awayTeam", {}))
+    home_score = event.get("homeScore", {}) or {}
+    away_score = event.get("awayScore", {}) or {}
+    set_keys = list_set_keys(home_score, away_score)
+
+    lines = [f"세트별 스코어입니다. {home} 대 {away}."]
+    if not set_keys:
+        lines.append("아직 세트별 스코어 정보가 없습니다.")
+    for key in set_keys:
+        set_number = key.replace("period", "")
+        home_value = score_value(home_score, key) or "0"
+        away_value = score_value(away_score, key) or "0"
+        lines.append(f"{set_number}세트: {home} {home_value}, {away} {away_value}.")
+
+        home_tiebreak = score_value(home_score, f"{key}TieBreak")
+        away_tiebreak = score_value(away_score, f"{key}TieBreak")
+        if home_tiebreak is not None or away_tiebreak is not None:
+            lines.append(
+                f"{set_number}세트 타이브레이크: "
+                f"{home} {home_tiebreak or '0'}, {away} {away_tiebreak or '0'}."
+            )
+
+    home_point = score_value(home_score, "point")
+    away_point = score_value(away_score, "point")
+    if home_point is not None or away_point is not None:
+        lines.append(f"현재 포인트: {home} {home_point or '0'}, {away} {away_point or '0'}.")
+
+    home_match_score = score_value(home_score, "current")
+    away_match_score = score_value(away_score, "current")
+    if home_match_score is not None or away_match_score is not None:
+        lines.append(f"현재 세트 스코어: {home} {home_match_score or '0'}, {away} {away_match_score or '0'}.")
+
+    return "\n".join(lines)
+
+
+def player_entries(team: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    sub_teams = team.get("subTeams")
+    if isinstance(sub_teams, list) and sub_teams:
+        for player in sub_teams:
+            if isinstance(player, dict):
+                yield player
+    else:
+        yield team
+
+
+def format_ranking(value: Any) -> str:
+    if value is None:
+        return "랭킹 정보 없음"
+    return f"{value}위"
+
+
+def format_player_info(event: dict[str, Any]) -> str:
+    home_team = event.get("homeTeam", {}) or {}
+    away_team = event.get("awayTeam", {}) or {}
+    lines = [f"선수 정보입니다. 경기: {event_title(event)}."]
+
+    for label, team in (("홈", home_team), ("어웨이", away_team)):
+        lines.append(f"{label} 선수:")
+        for player in player_entries(team):
+            name = clean_text(player.get("name") or player.get("shortName"))
+            ranking = format_ranking(player.get("ranking"))
+            country = clean_text((player.get("country") or {}).get("name"), "")
+            if country:
+                lines.append(f"{name}, 국가 {country}, 현재 랭킹 {ranking}.")
+            else:
+                lines.append(f"{name}, 현재 랭킹 {ranking}.")
+
+    return "\n".join(lines)
+
+
+def statistics_periods(stats_data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = stats_data.get("statistics", [])
+    if isinstance(raw, dict):
+        raw = [raw]
+    return [period for period in raw if isinstance(period, dict)]
+
+
+def format_statistics(stats_data: dict[str, Any], event: dict[str, Any]) -> str:
+    home = team_name(event.get("homeTeam", {}))
+    away = team_name(event.get("awayTeam", {}))
+    periods = statistics_periods(stats_data)
+    lines = [f"경기 세부 성적입니다. {home} 대 {away}."]
+
+    if not periods:
+        lines.append("현재 SofaScore에서 제공하는 statistics 정보가 없습니다.")
+        return "\n".join(lines)
+
+    for period in periods:
+        period_name = clean_text(period.get("periodName") or period.get("period") or period.get("name"), "전체")
+        lines.append(f"{period_name} 기준 성적:")
+        groups = period.get("groups", [])
+        if not isinstance(groups, list):
+            continue
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_name = clean_text(group.get("groupName") or group.get("name"), "")
+            if group_name:
+                lines.append(f"{group_name}:")
+
+            items = group.get("statisticsItems", [])
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                name = clean_text(item.get("name"))
+                home_value = clean_text(item.get("home"), "0")
+                away_value = clean_text(item.get("away"), "0")
+                lines.append(f"{name}: {home} {home_value}, {away} {away_value}.")
+
+    return "\n".join(lines)
+
+
+def format_summary(event: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"선택한 경기는 {event_title(event)}입니다.",
+            f"대회: {tournament_name(event)}.",
+            f"경기 상태: {status_text(event)}.",
+            format_set_scores(event),
+        ]
+    )
+
+
+def build_output(event: dict[str, Any], detail: str, client: SofascoreClient) -> str:
+    if detail == "summary":
+        return format_summary(event)
+    if detail == "players":
+        return format_player_info(event)
+    if detail == "sets":
+        return format_set_scores(event)
+    if detail == "stats":
+        try:
+            stats_data = client.event_statistics(int(event["id"]))
+        except RuntimeError as exc:
+            return f"경기 세부 성적을 불러오지 못했습니다. {exc}"
+        return format_statistics(stats_data, event)
+    if detail == "all":
+        sections = [format_summary(event), format_player_info(event)]
+        try:
+            sections.append(format_statistics(client.event_statistics(int(event["id"])), event))
+        except RuntimeError as exc:
+            sections.append(f"경기 세부 성적을 불러오지 못했습니다. {exc}")
+        return "\n\n".join(sections)
+    raise ValueError(f"지원하지 않는 상세 정보 유형입니다: {detail}")
+
+
+def event_matches_query(event: dict[str, Any], query: str) -> bool:
+    query_normalized = query.casefold()
+    fields = [
+        event_title(event),
+        tournament_name(event),
+        clean_text(event.get("slug"), ""),
+        clean_text(event.get("customId"), ""),
+    ]
+    return any(query_normalized in field.casefold() for field in fields)
+
+
+def make_selection(event: dict[str, Any]) -> TennisEventSelection:
+    return TennisEventSelection(
+        event_id=int(event["id"]),
+        title=event_title(event),
+        tournament=tournament_name(event),
+    )
+
+
+def print_event_list(events: list[dict[str, Any]], limit: int) -> None:
+    if not events:
+        print("현재 진행 중인 테니스 경기가 없습니다.")
+        return
+
+    print("현재 진행 중인 테니스 경기 목록입니다.")
+    for index, event in enumerate(events[:limit], start=1):
+        selection = make_selection(event)
+        print(f"{index}. [{selection.event_id}] {selection.title} / {selection.tournament} / {status_text(event)}")
+
+
+def select_event_interactively(events: list[dict[str, Any]], limit: int) -> dict[str, Any]:
+    visible_events = events[:limit]
+    print_event_list(visible_events, limit)
+    if not visible_events:
+        raise RuntimeError("선택할 수 있는 경기가 없습니다.")
+
+    while True:
+        user_input = input("경기 번호 또는 SofaScore event id를 입력하세요: ").strip()
+        if not user_input:
+            continue
+        if user_input.isdigit():
+            number = int(user_input)
+            if 1 <= number <= len(visible_events):
+                return visible_events[number - 1]
+            for event in visible_events:
+                if int(event.get("id", -1)) == number:
+                    return event
+        print("입력한 값과 일치하는 경기가 없습니다. 다시 입력해 주세요.")
+
+
+def choose_detail_interactively() -> str:
+    choices = {
+        "1": "players",
+        "2": "sets",
+        "3": "stats",
+        "4": "summary",
+        "5": "all",
+        "players": "players",
+        "sets": "sets",
+        "stats": "stats",
+        "summary": "summary",
+        "all": "all",
+        "선수": "players",
+        "세트": "sets",
+        "성적": "stats",
+        "요약": "summary",
+        "전체": "all",
+    }
+    print("원하는 정보를 선택하세요.")
+    print("1. 선수 이름과 랭킹")
+    print("2. 세트별 스코어")
+    print("3. 경기 내 세부 성적 statistics")
+    print("4. 경기 요약")
+    print("5. 전체")
+
+    while True:
+        user_input = input("요청 정보: ").strip().casefold()
+        detail = choices.get(user_input)
+        if detail:
+            return detail
+        print("지원하는 입력은 선수, 세트, 성적, 요약, 전체입니다.")
+
+
+def resolve_event(args: argparse.Namespace, client: SofascoreClient) -> dict[str, Any]:
+    if args.event_id is not None:
+        return client.event_detail(args.event_id)
+
+    events = client.live_tennis_events()
+    if args.query:
+        matches = [event for event in events if event_matches_query(event, args.query)]
+        if not matches:
+            raise RuntimeError(f"검색어 '{args.query}'와 일치하는 실시간 경기가 없습니다.")
+        if args.non_interactive:
+            return matches[0]
+        return select_event_interactively(matches, args.limit)
+
+    if args.non_interactive:
+        if not events:
+            raise RuntimeError("현재 진행 중인 테니스 경기가 없습니다.")
+        return events[0]
+    return select_event_interactively(events, args.limit)
+
+
+
+def run_live_info_mode(args: argparse.Namespace) -> None:
+    client = SofascoreClient()
+    mapped_args = argparse.Namespace(
+        event_id=args.live_event_id,
+        query=args.live_query,
+        non_interactive=args.live_non_interactive,
+        limit=args.live_limit,
+    )
+
+    if args.live_list:
+        print_event_list(client.live_tennis_events(), args.live_limit)
+        return
+
+    event = resolve_event(mapped_args, client)
+    detail = args.live_detail or choose_detail_interactively()
+    output = build_output(event, detail, client)
+    print("\n===== OUTPUT =====")
+    print(output)
+
+# =============================================================================
 # Main Pipeline & Serial
 # =============================================================================
 
@@ -875,7 +1299,33 @@ def main():
     parser.add_argument("--motion_min_yellow", type=float, default=DEFAULT_MOTION_MIN_YELLOW_SCORE)
     parser.add_argument("--disable_streak_detector", action="store_true")
     parser.add_argument("--streak_min_yellow", type=float, default=DEFAULT_STREAK_MIN_YELLOW_SCORE)
+
+    parser.add_argument("--live_info", action="store_true", help="Run SofaScore tennis text-output mode.")
+    parser.add_argument("--live_list", action="store_true", help="List current live tennis matches from SofaScore.")
+    parser.add_argument("--live_event_id", type=int, default=None, help="SofaScore event id for the selected tennis match.")
+    parser.add_argument("--live_query", default="", help="Search live matches by player, match, or tournament name.")
+    parser.add_argument(
+        "--live_detail",
+        choices=["summary", "players", "sets", "stats", "all"],
+        default=None,
+        help="Text output type: summary, players, sets, stats, or all.",
+    )
+    parser.add_argument("--live_limit", type=int, default=20, help="Maximum live matches to show in lists.")
+    parser.add_argument("--live_non_interactive", action="store_true", help="Use the first matching event without asking for input.")
     args = parser.parse_args()
+
+    if args.live_info or args.live_list:
+        try:
+            run_live_info_mode(args)
+        except KeyboardInterrupt:
+            print("\nUser stopped the program.")
+        except Exception as exc:
+            print(f"Error: {exc}")
+        return
+
+    if cv2 is None or np is None:
+        print("Video/hardware mode requires OpenCV and NumPy. Install cv2 and numpy, or run with --live_info.")
+        return
 
     serial_conn = None
     if args.mode == "hardware" and args.serial_port:
